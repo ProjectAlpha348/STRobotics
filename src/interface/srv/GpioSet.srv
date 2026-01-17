@@ -1,0 +1,5 @@
+uint32 line
+bool   value
+---
+bool   ok
+string msg

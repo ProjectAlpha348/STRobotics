@@ -1,0 +1,6 @@
+uint16 chan        # Numero del servo
+uint16 angle       # valore angolo 0-270
+uint8  step        # N° step al passo (velocità)
+---
+bool   ok
+string msg

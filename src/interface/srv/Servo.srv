@@ -1,0 +1,8 @@
+uint8    channels      # es. [0,1,2,...] (0..15 per PCA9685)
+int16    positions    # es. [10.0, 30.0, ...] (gradi/radianti)
+float32  speed        # es. 0.5  (fattore 0..1 o deg/s)
+
+---
+# Risposta
+bool   ok
+string message

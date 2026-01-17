@@ -1,0 +1,11 @@
+# Richiesta
+# Usa EITHER channels OR names (l'altro può essere vuoto)
+uint8[]  channels      # es. [0,1,2,...] (0..15 per PCA9685)
+string[] names         # es. ["hip_fl","knee_fl", ...]  (opzionale)
+float32[] positions    # es. [10.0, 30.0, ...] (gradi/radianti)
+float32   speed        # es. 0.5  (fattore 0..1 o deg/s)
+
+---
+# Risposta
+bool ok
+string message

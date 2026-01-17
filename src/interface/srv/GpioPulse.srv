@@ -1,0 +1,7 @@
+uint32 line
+uint32 on_ms
+uint32 off_ms
+uint32 repeat
+---
+bool   ok
+string msg

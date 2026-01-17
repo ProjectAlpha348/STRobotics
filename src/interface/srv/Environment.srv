@@ -1,0 +1,6 @@
+float64 temp
+float64 pres
+float64 humy
+---
+bool ok
+string data
