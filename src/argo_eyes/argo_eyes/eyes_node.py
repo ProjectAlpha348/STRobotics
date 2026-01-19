@@ -17,6 +17,7 @@ from typing import Any
 from .drivers.pca9548a import PCA9548A
 from .drivers.oled_luma import OledDevice
 from .renderer_real import draw_eye_frame
+from .renderer_real import tv_off_animation
 
 
 PRIORITY = {
@@ -34,6 +35,7 @@ class EyesNode(Node):
     def __init__(self):
         super().__init__("argo_eyes")
 
+        self.shutdown_requested = False
         self.declare_parameter("config", "")
         cfg_path = self.get_parameter("config").get_parameter_value().string_value
 
@@ -177,7 +179,10 @@ class EyesNode(Node):
                 self.start_blink()
         if "reset" in kv:
             self._set_state(self.cfg.behavior.default_state)
-            return
+        if kv.get("state", "").lower() == "stop":
+            self.shutdown_requested = True
+        return
+
         # look=x,y (opzionale futuro)
         # if "look" in kv: ...
 
@@ -193,6 +198,36 @@ class EyesNode(Node):
 
     def tick(self):
         now = time.time()
+        if self.shutdown_requested:
+            # stop timer per evitare re-entry
+            try:
+                self.timer.cancel()
+            except Exception:
+                pass
+
+            # animazione CRT-off
+            try:
+                tv_off_animation(
+                    self.oled_left,
+                    self.oled_right,
+                    duration_s=0.4,
+                    fps=self.cfg.display.fps,
+                )
+            except Exception as e:
+                self.get_logger().error(f"tv_off_animation failed: {e}")
+
+            # spegni schermi (nero) e chiudi nodo
+            try:
+                self.oled_left.draw(lambda d: d.rectangle((0, 0, 127, 63), fill=0))
+                self.oled_right.draw(lambda d: d.rectangle((0, 0, 127, 63), fill=0))
+            except Exception:
+                pass
+
+            # termina in modo pulito
+            self.get_logger().info("EyesNode stopping by state=stop")
+            rclpy.shutdown()
+            return
+
         # auto reset alert
         if self.current_state == "alert" and self.alert_until_t > 0.0 and now >= self.alert_until_t:
             fallback = getattr(self.cfg.behavior, "alert_fallback_state", "neutral")

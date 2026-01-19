@@ -59,3 +59,53 @@ def draw_eye_frame(
     if plan.pulse_on is False and params.pulse:
         # oscura un velo leggero (banda superiore) per far percepire "pulsazione"
         draw.rectangle((0, 0, 127, 10), fill=OFF)
+
+import time
+
+def tv_off_animation(oled_left, oled_right, duration_s: float = 0.8, fps: int = 30):
+    """
+    Effetto spegnimento CRT:
+    1) comprime verticalmente verso una linea centrale
+    2) poi comprime orizzontalmente fino a un punto
+    3) schermo nero
+    """
+    frames = max(8, int(duration_s * fps))
+    cx, cy = 64, 32  # 128x64 fisso; se vuoi, puoi leggerlo da config
+
+    def _clear(draw):
+        draw.rectangle((0, 0, 127, 63), fill=0)
+
+    # Phase 1: collapse verticale (da full a linea)
+    for i in range(frames):
+        t = i / (frames - 1)
+        half_h = int(round((1.0 - t) * 32))  # 32 -> 0
+        y0 = cy - half_h
+        y1 = cy + half_h
+
+        def _frame(draw):
+            _clear(draw)
+            # rettangolo "immagine" che collassa
+            draw.rectangle((0, y0, 127, y1), fill=255)
+
+        oled_left.draw(_frame)
+        oled_right.draw(_frame)
+        time.sleep(1.0 / fps)
+
+    # Phase 2: collapse orizzontale (linea -> punto)
+    for i in range(frames):
+        t = i / (frames - 1)
+        half_w = int(round((1.0 - t) * 64))  # 64 -> 0
+        x0 = cx - half_w
+        x1 = cx + half_w
+
+        def _frame(draw):
+            _clear(draw)
+            draw.rectangle((x0, cy, x1, cy), fill=255)
+
+        oled_left.draw(_frame)
+        oled_right.draw(_frame)
+        time.sleep(1.0 / fps)
+
+    # Final: nero
+    oled_left.draw(_clear)
+    oled_right.draw(_clear)
