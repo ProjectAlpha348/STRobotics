@@ -1,0 +1,29 @@
+<launch>
+  <!-- Occhi -->
+  <node
+    pkg="argo_eyes"
+    exec="eyes_node"
+    name="argo_eyes"
+    output="screen">
+    <param
+      name="config"
+      value="$(find-pkg-share argo_eyes)/config/eyes.yaml"/>
+  </node>
+
+  <!-- Esempi / placeholder: abilitali quando hai i nomi corretti -->
+
+  <!-- GPIO utils -->
+  <!--
+  <node pkg="gpio_utils" exec="gpio_node" name="gpio_utils" output="screen"/>
+  -->
+
+  <!-- Display (se hai un nodo separato oltre agli occhi) -->
+  <!--
+  <node pkg="display" exec="display_node" name="display_node" output="screen"/>
+  -->
+
+  <!-- Vision -->
+  <!--
+  <node pkg="vision" exec="vision_node" name="vision_node" output="screen"/>
+  -->
+</launch>

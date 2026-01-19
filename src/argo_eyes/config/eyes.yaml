@@ -1,0 +1,61 @@
+display:
+  width: 128
+  height: 64
+  fps: 30
+  driver: "sh1106"
+  i2c_bus: 1
+
+  mux:
+    type: "pca9548a"
+    address: 0x70
+
+  devices:
+    - name: "left"
+      address: 0x3C
+      mux_channel: 1
+    - name: "right"
+      address: 0x3C
+      mux_channel: 0
+
+
+geometry:
+  center: [64, 32]
+  sclera_rx: 46
+  sclera_ry: 20
+  iris_rx: 18
+  iris_ry: 16
+  pupil_rx: 12
+  pupil_ry: 9
+  highlight_center: [50, 24]
+  highlight_rx: 8
+  highlight_ry: 5
+
+states:
+  neutral:
+    open: 1.0
+    saccades: true
+  attentive:
+    open: 1.0
+    pupil_scale: [1.08, 1.10]
+    pupil_offset_left:  [ +2, 0 ]
+    pupil_offset_right: [ -2, 0 ]
+    saccades: false
+  sleep:
+    open: 0.35
+    saccades: false
+  alert:
+    open: 0.8
+    pupil_override: { rx: 7, ry: 14 }
+    pulse: true
+
+blink:
+  enabled: true
+  interval_s: [3.0, 6.0]
+  frame_open: [1.0, 0.75, 0.50, 0.25, 0.10, 0.25, 0.50, 1.0]
+  frame_dt_ms: 30
+
+behavior:
+  default_state: "neutral"
+  alert_pulse_dt_ms: 180
+  alert_timeout_s: 3.0
+  alert_fallback_state: "neutral"
