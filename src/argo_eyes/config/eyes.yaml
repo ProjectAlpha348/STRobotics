@@ -4,7 +4,6 @@ display:
   fps: 30
   driver: "sh1106"
   i2c_bus: 1
-
   mux:
     type: "pca9548a"
     address: 0x70

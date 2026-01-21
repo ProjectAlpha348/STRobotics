@@ -42,6 +42,8 @@ Makefile
 
 # Modello specifico (ArcFace)
 ros2_ws/src/vision/models/arcface.onnx
+/models/
+/**/models/
 
 # Tutti i modelli ONNX (fallback futuro)
 *.onnx
