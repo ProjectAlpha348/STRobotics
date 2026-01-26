@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+import os
+import time
+
+import cv2
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+
+from std_msgs.msg import Float32, Bool
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+
+from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose, BoundingBox2D
+from ament_index_python.packages import get_package_share_directory
+
+
+def open_camera(camera_index: int, camera_device: str, width: int, height: int) -> cv2.VideoCapture:
+    cap = None
+
+    if camera_device:
+        cap = cv2.VideoCapture(camera_device, cv2.CAP_V4L2)
+
+    if cap is None or not cap.isOpened():
+        cap = cv2.VideoCapture(int(camera_index), cv2.CAP_V4L2)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Impossibile aprire camera (index={camera_index}, device='{camera_device}')")
+
+    if width > 0:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+    if height > 0:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+
+    # Non sempre supportato, ma aiuta su molte webcam
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+class VisionNode(Node):
+    def __init__(self):
+        super().__init__("vision_node")
+
+        # --- Params ---
+        self.declare_parameter("camera_index", 0)
+        self.declare_parameter("camera_device", "")
+        self.declare_parameter("image_width", 640)
+        self.declare_parameter("image_height", 480)
+
+        self.declare_parameter("conf_thres", 0.35)
+        self.declare_parameter("iou_thres", 0.45)
+        self.declare_parameter("target_class", -1)          # -1 = tutte, 0 = person, ...
+        self.declare_parameter("publish_annotated", True)
+        self.declare_parameter("rate_hz", 30.0)
+
+        # se vuoi cambiare modello senza toccare codice
+        self.declare_parameter("model_relpath", "models/yolo/yolov8n.pt")
+
+        self.camera_index = int(self.get_parameter("camera_index").value)
+        self.camera_device = str(self.get_parameter("camera_device").value)
+        self.w = int(self.get_parameter("image_width").value)
+        self.h = int(self.get_parameter("image_height").value)
+
+        self.conf_thres = float(self.get_parameter("conf_thres").value)
+        self.iou_thres = float(self.get_parameter("iou_thres").value)
+        self.target_class = int(self.get_parameter("target_class").value)
+
+        self.publish_annotated = bool(self.get_parameter("publish_annotated").value)
+        self.rate_hz = float(self.get_parameter("rate_hz").value)
+        if self.rate_hz <= 0:
+            self.rate_hz = 30.0
+
+        # --- Resolve model path from share ---
+        share = get_package_share_directory("robot_head")
+        model_relpath = str(self.get_parameter("model_relpath").value).lstrip("/")
+        self.model_path = os.path.join(share, model_relpath)
+
+        if not os.path.exists(self.model_path):
+            raise RuntimeError(f"Modello YOLO non trovato: {self.model_path}")
+
+        # --- pubs/subs ---
+        self.pub_det = self.create_publisher(Detection2DArray, "/tommy/vision/detections", 10)
+        self.pub_img = self.create_publisher(Image, "/tommy/vision/image_annotated", qos_profile_sensor_data)
+        self.pub_fps = self.create_publisher(Float32, "/tommy/vision/fps", 10)
+        self.sub_enable = self.create_subscription(Bool, "/tommy/vision/enable", self._on_enable, 10)
+
+        self.bridge = CvBridge()
+        self.enabled = True
+
+        # --- Load YOLO ---
+        from ultralytics import YOLO  # import qui per isolare errori dipendenza
+        self.get_logger().info(f"Carico YOLO: {self.model_path}")
+        self.model = YOLO(self.model_path)
+
+        # --- Camera ---
+        self.get_logger().info(f"Apro camera: index={self.camera_index}, device='{self.camera_device}', {self.w}x{self.h}")
+        self.cap = open_camera(self.camera_index, self.camera_device, self.w, self.h)
+
+        self.last_t = time.perf_counter()
+        self.fps_ema = 0.0
+
+        self.timer = self.create_timer(1.0 / self.rate_hz, self._tick)
+        self.get_logger().info("vision_node avviato.")
+
+    def _on_enable(self, msg: Bool):
+        self.enabled = bool(msg.data)
+        self.get_logger().info(f"Vision enable = {self.enabled}")
+
+    def _tick(self):
+        if not self.enabled:
+            return
+
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            self.get_logger().warn("Frame non disponibile dalla camera.")
+            return
+
+        results = self.model.predict(
+            source=frame,
+            conf=self.conf_thres,
+            iou=self.iou_thres,
+            verbose=False
+        )
+
+        det_msg = self._to_detection2d_array(results, frame.shape[1], frame.shape[0])
+        det_msg.header.stamp = self.get_clock().now().to_msg()
+        det_msg.header.frame_id = "camera_frame"
+        self.pub_det.publish(det_msg)
+
+        if self.publish_annotated and self.pub_img.get_subscription_count() > 0:
+            annotated = results[0].plot()
+            img_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
+            img_msg.header = det_msg.header
+            self.pub_img.publish(img_msg)
+
+        # FPS EMA
+        now = time.perf_counter()
+        dt = now - self.last_t
+        self.last_t = now
+        inst_fps = (1.0 / dt) if dt > 0 else 0.0
+        self.fps_ema = (0.9 * self.fps_ema) + (0.1 * inst_fps)
+
+        m = Float32()
+        m.data = float(self.fps_ema)
+        self.pub_fps.publish(m)
+
+    def _to_detection2d_array(self, results, img_w: int, img_h: int) -> Detection2DArray:
+        out = Detection2DArray()
+
+        if not results or len(results) == 0:
+            return out
+
+        r0 = results[0]
+        if r0.boxes is None:
+            return out
+
+        boxes = r0.boxes
+        xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, "cpu") else boxes.xyxy
+        conf = boxes.conf.cpu().numpy() if hasattr(boxes.conf, "cpu") else boxes.conf
+        cls = boxes.cls.cpu().numpy() if hasattr(boxes.cls, "cpu") else boxes.cls
+
+        for (x1, y1, x2, y2), score, c in zip(xyxy, conf, cls):
+            c_id = int(c)
+            if self.target_class >= 0 and c_id != self.target_class:
+                continue
+
+            x1 = float(max(0.0, min(x1, img_w - 1)))
+            y1 = float(max(0.0, min(y1, img_h - 1)))
+            x2 = float(max(0.0, min(x2, img_w - 1)))
+            y2 = float(max(0.0, min(y2, img_h - 1)))
+
+            w = max(0.0, x2 - x1)
+            h = max(0.0, y2 - y1)
+            cx = x1 + (w / 2.0)
+            cy = y1 + (h / 2.0)
+
+            det = Detection2D()
+            det.bbox = BoundingBox2D()
+            det.bbox.center.position.x = float(cx)
+            det.bbox.center.position.y = float(cy)
+            det.bbox.center.theta = 0.0
+            det.bbox.size_x = float(w)
+            det.bbox.size_y = float(h)
+
+            hyp = ObjectHypothesisWithPose()
+            hyp.hypothesis.class_id = str(c_id)
+            hyp.hypothesis.score = float(score)
+            det.results.append(hyp)
+
+            out.detections.append(det)
+
+        return out
+
+    def destroy_node(self):
+        try:
+            if hasattr(self, "cap") and self.cap is not None:
+                self.cap.release()
+        except Exception:
+            pass
+        super().destroy_node()
+
+
+def main():
+    rclpy.init()
+    node = VisionNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
