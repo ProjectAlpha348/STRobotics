@@ -58,6 +58,7 @@ setup(
             'vision_node = robot_head.vision_node:main',
             'speak_node = robot_head.speak_node:main',
             'head_orchestrator = robot_head.head_orchestrator:main',
+            'eyes_node = robot_head.eyes_node:main',
         ],
     },
 )
