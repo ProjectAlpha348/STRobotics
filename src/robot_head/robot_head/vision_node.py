@@ -7,7 +7,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
-from std_msgs.msg import Float32, Bool
+from std_msgs.msg import Float32, Bool, String
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
@@ -83,6 +83,7 @@ class VisionNode(Node):
         self.pub_img = self.create_publisher(Image, "/tommy/vision/image_annotated", qos_profile_sensor_data)
         self.pub_fps = self.create_publisher(Float32, "/tommy/vision/fps", 10)
         self.sub_enable = self.create_subscription(Bool, "/tommy/vision/enable", self._on_enable, 10)
+        self.sys_sub = self.create_subscription(String, "/robot_head/system/cmd", self._on_system_cmd, 10)
 
         self.bridge = CvBridge()
         self.enabled = True
@@ -105,6 +106,27 @@ class VisionNode(Node):
     def _on_enable(self, msg: Bool):
         self.enabled = bool(msg.data)
         self.get_logger().info(f"Vision enable = {self.enabled}")
+
+    def _on_system_cmd(self, msg):
+        if msg.data.strip().lower() == "shutdown":
+            self.get_logger().info("Shutdown richiesto: rilascio camera e chiusura.")
+            try:
+                if self._timer is not None:
+                    self._timer.cancel()
+            except Exception:
+                pass
+            try:
+                if self.cap is not None:
+                    self.cap.release()
+            except Exception:
+                pass
+            try:
+                import cv2
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+            self.destroy_node()
+            rclpy.shutdown()
 
     def _tick(self):
         if not self.enabled:

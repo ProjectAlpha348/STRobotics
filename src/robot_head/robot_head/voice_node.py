@@ -77,6 +77,7 @@ class VoiceNode(Node):
         self.pub_partial = self.create_publisher(String, '/tommy/voice/partial', 10) if self.enable_partial else None
         self.pub_status = self.create_publisher(String, '/tommy/voice/status', 10)
         self.sub_cmd = self.create_subscription(String, '/tommy/voice/cmd', self._on_cmd, 10)
+        self.sys_sub = self.create_subscription(String, "/robot_head/system/cmd", self._on_system_cmd, 10)
 
         # ---------------- Runtime state ----------------
         self._audio_q: "queue.Queue[bytes]" = queue.Queue(maxsize=100)
@@ -95,6 +96,13 @@ class VoiceNode(Node):
         msg = String()
         msg.data = s
         self.pub_status.publish(msg)
+
+    def _on_system_cmd(self, msg):
+        if msg.data.strip().lower() == "shutdown":
+            self.get_logger().info("Shutdown richiesto: stop ascolto e chiusura.")
+            self._stop_listening()   # la tua funzione esistente
+            self.destroy_node()
+            rclpy.shutdown()
 
     def _on_cmd(self, msg: String):
         cmd = (msg.data or "").strip().lower()

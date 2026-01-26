@@ -1,12 +1,13 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, RegisterEventHandler, Shutdown
 from launch.substitutions import LaunchConfiguration
+from launch.event_handlers import OnProcessExit
 
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # ---------------- Launch args ----------------
+    # ---------------- Launch args (Vision) ----------------
     camera_index = LaunchConfiguration("camera_index")
     camera_device = LaunchConfiguration("camera_device")
     image_width = LaunchConfiguration("image_width")
@@ -18,6 +19,7 @@ def generate_launch_description():
     rate_hz = LaunchConfiguration("rate_hz")
     model_relpath = LaunchConfiguration("model_relpath")
 
+    # ---------------- Launch args (Voice) ----------------
     audio_device = LaunchConfiguration("audio_device")
     input_sample_rate = LaunchConfiguration("input_sample_rate")
     vosk_sample_rate = LaunchConfiguration("vosk_sample_rate")
@@ -26,17 +28,127 @@ def generate_launch_description():
     min_text_len = LaunchConfiguration("min_text_len")
     resample_to_vosk_rate = LaunchConfiguration("resample_to_vosk_rate")
 
-    # ---- Coordinamento orchestrator (topic standard) ----
-    topic_state = LaunchConfiguration("topic_state")
-    topic_eyes_cmd = LaunchConfiguration("topic_eyes_cmd")
-    topic_voice_cmd = LaunchConfiguration("topic_voice_cmd")
-    topic_speak_cmd = LaunchConfiguration("topic_speak_cmd")
-    topic_speak_event = LaunchConfiguration("topic_speak_event")
+    # ---------------- Launch args (Orchestrator/Eyes) ----------------
+    eyes_cmd_topic = LaunchConfiguration("eyes_cmd_topic")
+    mode_topic = LaunchConfiguration("mode_topic")
+    listen_resume_delay_ms = LaunchConfiguration("listen_resume_delay_ms")
+    default_state = LaunchConfiguration("default_state")
 
+    # Speak/Voice topics (allineati al tuo speak_node)
+    speech_say_topic = LaunchConfiguration("speech_say_topic")
+    tts_state_topic = LaunchConfiguration("tts_state_topic")
+    voice_cmd_topic = LaunchConfiguration("voice_cmd_topic")
+    vision_enable_topic = LaunchConfiguration("vision_enable_topic")
+
+    # ---------------- Launch args (Eyes hardware) ----------------
+    i2c_bus = LaunchConfiguration("i2c_bus")
+    tca_addr = LaunchConfiguration("tca_addr")
+    oled_addr = LaunchConfiguration("oled_addr")
+    left_channel = LaunchConfiguration("left_channel")
+    right_channel = LaunchConfiguration("right_channel")
+    rotate = LaunchConfiguration("rotate")
+
+    # Blink defaults
+    blink_enabled = LaunchConfiguration("blink_enabled")
+    blink_min_s = LaunchConfiguration("blink_min_s")
+    blink_max_s = LaunchConfiguration("blink_max_s")
+
+    # ---------------- Nodes ----------------
+    vision_node = Node(
+        package="robot_head",
+        executable="vision_node",
+        name="vision",
+        output="screen",
+        parameters=[{
+            "camera_index": camera_index,
+            "camera_device": camera_device,
+            "image_width": image_width,
+            "image_height": image_height,
+            "conf_thres": conf_thres,
+            "iou_thres": iou_thres,
+            "target_class": target_class,
+            "publish_annotated": publish_annotated,
+            "rate_hz": rate_hz,
+            "model_relpath": model_relpath,
+        }],
+    )
+
+    voice_node = Node(
+        package="robot_head",
+        executable="voice_node",
+        name="voice",
+        output="screen",
+        parameters=[{
+            "device": audio_device,
+            "input_sample_rate": input_sample_rate,
+            "vosk_sample_rate": vosk_sample_rate,
+            "auto_start": auto_start,
+            "enable_partial": enable_partial,
+            "min_text_len": min_text_len,
+            "resample_to_vosk_rate": resample_to_vosk_rate,
+            # Se nel voice_node usi cmd_topic parametrico:
+            # "cmd_topic": voice_cmd_topic,
+        }],
+    )
+
+    speak_node = Node(
+        package="robot_head",
+        executable="speak_node",
+        name="speak",
+        output="screen",
+        # Se il tuo speak_node NON supporta parametri, puoi lasciare vuoto.
+        # parameters=[{"say_topic": speech_say_topic, "state_topic": tts_state_topic}],
+    )
+
+    eyes_node = Node(
+        package="robot_head",
+        executable="eyes_node",
+        name="eyes",
+        output="screen",
+        parameters=[{
+            "cmd_topic": eyes_cmd_topic,
+            "i2c_bus": i2c_bus,
+            "tca_addr": tca_addr,
+            "oled_addr": oled_addr,
+            "left_channel": left_channel,
+            "right_channel": right_channel,
+            "rotate": rotate,
+            "blink_enabled": blink_enabled,
+            "blink_min_s": blink_min_s,
+            "blink_max_s": blink_max_s,
+        }],
+    )
+
+    orchestrator_node = Node(
+        package="robot_head",
+        executable="head_orchestrator",
+        name="orchestrator",
+        output="screen",
+        parameters=[{
+            "eyes_cmd_topic": eyes_cmd_topic,
+            "mode_topic": mode_topic,
+            "listen_resume_delay_ms": listen_resume_delay_ms,
+            "default_state": default_state,
+            "speech_say_topic": speech_say_topic,
+            "tts_state_topic": tts_state_topic,
+            "voice_cmd_topic": voice_cmd_topic,
+            "vision_enable_topic": vision_enable_topic,
+        }],
+    )
+
+    # ---------------- If orchestrator exits => shutdown whole launch ----------------
+    shutdown_on_orchestrator_exit = RegisterEventHandler(
+        OnProcessExit(
+            target_action=orchestrator_node,
+            on_exit=[Shutdown(reason="Orchestrator exited -> shutdown all nodes")],
+        )
+    )
+
+    # ---------------- LaunchDescription ----------------
     return LaunchDescription([
-        # ---------------- Arguments ----------------
+        # Vision args
         DeclareLaunchArgument("camera_index", default_value="0"),
-        DeclareLaunchArgument("camera_device", default_value=""),   # es: /dev/video0
+        DeclareLaunchArgument("camera_device", default_value=""),  # es: /dev/video0
         DeclareLaunchArgument("image_width", default_value="640"),
         DeclareLaunchArgument("image_height", default_value="480"),
         DeclareLaunchArgument("conf_thres", default_value="0.35"),
@@ -46,107 +158,48 @@ def generate_launch_description():
         DeclareLaunchArgument("rate_hz", default_value="30.0"),
         DeclareLaunchArgument("model_relpath", default_value="models/yolo/yolov8n.pt"),
 
-        DeclareLaunchArgument("audio_device", default_value="-1"),          # sounddevice index
-        DeclareLaunchArgument("input_sample_rate", default_value="48000"),  # 44100/48000
+        # Voice args
+        DeclareLaunchArgument("audio_device", default_value="-1"),
+        DeclareLaunchArgument("input_sample_rate", default_value="48000"),
         DeclareLaunchArgument("vosk_sample_rate", default_value="16000"),
         DeclareLaunchArgument("auto_start", default_value="true"),
         DeclareLaunchArgument("enable_partial", default_value="false"),
         DeclareLaunchArgument("min_text_len", default_value="2"),
         DeclareLaunchArgument("resample_to_vosk_rate", default_value="true"),
 
-        # ---- Topic standard (modifica qui se vuoi cambiare namespace) ----
-        DeclareLaunchArgument("topic_state", default_value="/robot_head/state"),
-        DeclareLaunchArgument("topic_eyes_cmd", default_value="/robot_head/eyes/cmd"),
-        DeclareLaunchArgument("topic_voice_cmd", default_value="/robot_head/voice/cmd"),
-        DeclareLaunchArgument("topic_speak_cmd", default_value="/robot_head/speak/cmd"),
-        DeclareLaunchArgument("topic_speak_event", default_value="/robot_head/speak/event"),
+        # Orchestrator/Eyes topics
+        DeclareLaunchArgument("eyes_cmd_topic", default_value="/robot_head/eyes/cmd"),
+        DeclareLaunchArgument("mode_topic", default_value="/robot_head/state"),
+        DeclareLaunchArgument("listen_resume_delay_ms", default_value="250"),
+        DeclareLaunchArgument("default_state", default_value="idle"),
 
-        # ---------------- Nodes ----------------
-        Node(
-            package="robot_head",
-            executable="vision_node",
-            name="vision",
-            output="screen",
-            parameters=[{
-                "camera_index": camera_index,
-                "camera_device": camera_device,
-                "image_width": image_width,
-                "image_height": image_height,
-                "conf_thres": conf_thres,
-                "iou_thres": iou_thres,
-                "target_class": target_class,
-                "publish_annotated": publish_annotated,
-                "rate_hz": rate_hz,
-                "model_relpath": model_relpath,
-            }],
-        ),
+        # Speak/Voice/Vision topics (allineati al tuo speak_node attuale)
+        DeclareLaunchArgument("speech_say_topic", default_value="/tommy/speech/say"),
+        DeclareLaunchArgument("tts_state_topic", default_value="/tommy/voice/state"),
+        DeclareLaunchArgument("voice_cmd_topic", default_value="/tommy/voice/cmd"),
+        DeclareLaunchArgument("vision_enable_topic", default_value="/tommy/vision/enable"),
 
-        Node(
-            package="robot_head",
-            executable="voice_node",
-            name="voice",
-            output="screen",
-            parameters=[{
-                "device": audio_device,
-                "input_sample_rate": input_sample_rate,
-                "vosk_sample_rate": vosk_sample_rate,
-                "auto_start": auto_start,
-                "enable_partial": enable_partial,
-                "min_text_len": min_text_len,
-                "resample_to_vosk_rate": resample_to_vosk_rate,
+        # Eyes hardware
+        DeclareLaunchArgument("i2c_bus", default_value="1"),
+        DeclareLaunchArgument("tca_addr", default_value="112"),  # 0x70 = 112
+        DeclareLaunchArgument("oled_addr", default_value="60"),  # 0x3C = 60
+        DeclareLaunchArgument("left_channel", default_value="0"),
+        DeclareLaunchArgument("right_channel", default_value="1"),
+        DeclareLaunchArgument("rotate", default_value="0"),
 
-                # Coordinamento (da implementare nel voice_node):
-                "cmd_topic": topic_voice_cmd,   # ascolta comandi: listen=0/1, reset=1
-            }],
-        ),
+        # Blink tuning
+        DeclareLaunchArgument("blink_enabled", default_value="true"),
+        DeclareLaunchArgument("blink_min_s", default_value="3.0"),
+        DeclareLaunchArgument("blink_max_s", default_value="7.0"),
 
-        Node(
-            package="robot_head",
-            executable="speak_node",
-            name="speak",
-            output="screen",
-            parameters=[{
-                # Coordinamento (da implementare nel speak_node):
-                "cmd_topic": topic_speak_cmd,       # riceve testo / cmd speak
-                "event_topic": topic_speak_event,   # pubblica speaking=1/0
-            }],
-        ),
+        # Nodes
+        vision_node,
+        voice_node,
+        speak_node,
+        eyes_node,
+        orchestrator_node,
 
-        Node(
-            package="robot_head",
-            executable="eyes_node",
-            name="eyes",
-            output="screen",
-            parameters=[{
-                # Coordinamento (da implementare nel eyes_node):
-                "cmd_topic": topic_eyes_cmd,   # riceve: state=..., blink=0/1
-            }],
-        ),
-
-        Node(
-            package="robot_head",
-            executable="head_orchestrator",
-            name="orchestrator",
-            output="screen",
-            parameters=[{
-                # Topic standard usati dall’orchestrator
-                "topic_state": topic_state,
-                "topic_eyes_cmd": topic_eyes_cmd,
-                "topic_voice_cmd": topic_voice_cmd,
-                "topic_speak_cmd": topic_speak_cmd,
-                "topic_speak_event": topic_speak_event,
-
-                # Policy base (puoi rifinirle)
-                "speaking_disable_listen": True,
-                "speaking_eyes_state": "attentive",
-                "speaking_blink": 0,
-                "listening_eyes_state": "alert",
-                "listening_blink": 1,
-                "idle_eyes_state": "normal",
-                "idle_blink": 1,
-
-                # anti-rientro audio: delay prima di riattivare listen
-                "listen_resume_delay_ms": 250,
-            }],
-        ),
+        # Shutdown behavior
+        shutdown_on_orchestrator_exit,
     ])
+
