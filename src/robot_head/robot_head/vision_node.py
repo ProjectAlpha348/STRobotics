@@ -32,7 +32,7 @@ def open_camera(camera_index: int, camera_device: str, width: int, height: int) 
     if height > 0:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
 
-    # Non sempre supportato, ma aiuta su molte webcam
+    # riduce buffering su molte webcam
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
@@ -41,7 +41,7 @@ class VisionNode(Node):
     def __init__(self):
         super().__init__("vision_node")
 
-        # --- Params ---
+        # ---------------- Params
         self.declare_parameter("camera_index", 0)
         self.declare_parameter("camera_device", "")
         self.declare_parameter("image_width", 640)
@@ -49,11 +49,10 @@ class VisionNode(Node):
 
         self.declare_parameter("conf_thres", 0.35)
         self.declare_parameter("iou_thres", 0.45)
-        self.declare_parameter("target_class", -1)          # -1 = tutte, 0 = person, ...
+        self.declare_parameter("target_class", -1)          # -1 tutte, 0 person, ...
         self.declare_parameter("publish_annotated", True)
         self.declare_parameter("rate_hz", 30.0)
 
-        # se vuoi cambiare modello senza toccare codice
         self.declare_parameter("model_relpath", "models/yolo/yolov8n.pt")
 
         self.camera_index = int(self.get_parameter("camera_index").value)
@@ -70,32 +69,44 @@ class VisionNode(Node):
         if self.rate_hz <= 0:
             self.rate_hz = 30.0
 
-        # --- Resolve model path from share ---
+        # ---------------- Model path
         share = get_package_share_directory("robot_head")
         model_relpath = str(self.get_parameter("model_relpath").value).lstrip("/")
         self.model_path = os.path.join(share, model_relpath)
-
         if not os.path.exists(self.model_path):
             raise RuntimeError(f"Modello YOLO non trovato: {self.model_path}")
 
-        # --- pubs/subs ---
+        # ---------------- ROS pubs/subs
         self.pub_det = self.create_publisher(Detection2DArray, "/tommy/vision/detections", 10)
         self.pub_img = self.create_publisher(Image, "/tommy/vision/image_annotated", qos_profile_sensor_data)
         self.pub_fps = self.create_publisher(Float32, "/tommy/vision/fps", 10)
+
+        self.pub_state = self.create_publisher(String, "/tommy/vision/state", 10)
+
         self.sub_enable = self.create_subscription(Bool, "/tommy/vision/enable", self._on_enable, 10)
         self.sys_sub = self.create_subscription(String, "/robot_head/system/cmd", self._on_system_cmd, 10)
 
         self.bridge = CvBridge()
-        self.enabled = True
 
-        # --- Load YOLO ---
-        from ultralytics import YOLO  # import qui per isolare errori dipendenza
+        # ---------------- State
+        self.enabled = True  # default
+        self._state = "idle"
+        self._publish_state("idle")
+
+        # ---------------- YOLO load
+        from ultralytics import YOLO
         self.get_logger().info(f"Carico YOLO: {self.model_path}")
         self.model = YOLO(self.model_path)
 
-        # --- Camera ---
-        self.get_logger().info(f"Apro camera: index={self.camera_index}, device='{self.camera_device}', {self.w}x{self.h}")
-        self.cap = open_camera(self.camera_index, self.camera_device, self.w, self.h)
+        # ---------------- Camera (aperta solo se enabled)
+        self.cap = None
+        if self.enabled:
+            try:
+                self._ensure_camera_open()
+                self._publish_state("running")
+            except Exception as e:
+                self.get_logger().warning(f"Camera non disponibile all'avvio: {e}")
+                self._publish_state("error")
 
         self.last_t = time.perf_counter()
         self.fps_ema = 0.0
@@ -103,39 +114,99 @@ class VisionNode(Node):
         self.timer = self.create_timer(1.0 / self.rate_hz, self._tick)
         self.get_logger().info("vision_node avviato.")
 
+    # ----------------- State helpers
+    def _publish_state(self, s: str):
+        self._state = s
+        m = String()
+        m.data = self._state
+        self.pub_state.publish(m)
+
+    # ----------------- Camera helpers
+    def _ensure_camera_open(self):
+        # chiamare SOLO quando enabled=True
+        if self.cap is not None and self.cap.isOpened():
+            return
+        self.get_logger().info(
+            f"Apro camera: index={self.camera_index}, device='{self.camera_device}', {self.w}x{self.h}"
+        )
+        self.cap = open_camera(self.camera_index, self.camera_device, self.w, self.h)
+
+    def _release_camera(self):
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        except Exception:
+            pass
+        self.cap = None
+
+    # ----------------- Callbacks
     def _on_enable(self, msg: Bool):
-        self.enabled = bool(msg.data)
+        new_enabled = bool(msg.data)
+        if new_enabled == self.enabled:
+            return
+
+        self.enabled = new_enabled
         self.get_logger().info(f"Vision enable = {self.enabled}")
 
-    def _on_system_cmd(self, msg):
+        if not self.enabled:
+            # DISATTIVAZIONE REALE: rilascio immediato della webcam
+            self._release_camera()
+            self._publish_state("idle")
+        else:
+            # riattivazione: tenta riapertura
+            try:
+                self._ensure_camera_open()
+                self._publish_state("running")
+            except Exception as e:
+                self.get_logger().warning(f"Impossibile riaprire camera: {e}")
+                self._publish_state("error")
+
+    def _on_system_cmd(self, msg: String):
         if msg.data.strip().lower() == "shutdown":
-            self.get_logger().info("Shutdown richiesto: rilascio camera e chiusura.")
+            self.get_logger().info("Shutdown richiesto: stop timer, rilascio camera, chiusura nodo.")
             try:
-                if self._timer is not None:
-                    self._timer.cancel()
+                if self.timer is not None:
+                    self.timer.cancel()
             except Exception:
                 pass
+
+            self.enabled = False
+            self._release_camera()
+
             try:
-                if self.cap is not None:
-                    self.cap.release()
-            except Exception:
-                pass
-            try:
-                import cv2
                 cv2.destroyAllWindows()
             except Exception:
                 pass
+
             self.destroy_node()
             rclpy.shutdown()
 
+    # ----------------- Main loop
     def _tick(self):
+        # GUARD RAIL: se disabilitato, NON fare nulla e soprattutto NON riaprire la camera
         if not self.enabled:
             return
 
+        # enabled=True da qui in poi
+
+        # se camera non aperta, prova ad aprire
+        if self.cap is None or not self.cap.isOpened():
+            try:
+                self._ensure_camera_open()
+            except Exception as e:
+                self.get_logger().warn(f"Camera non disponibile: {e}")
+                self._publish_state("error")
+                return
+
         ok, frame = self.cap.read()
         if not ok or frame is None:
-            self.get_logger().warn("Frame non disponibile dalla camera.")
+            self.get_logger().warn("Frame non disponibile (rilascio camera, stato=error).")
+            self._release_camera()
+            self._publish_state("error")
             return
+
+        if self._state != "running":
+            self._publish_state("running")
 
         results = self.model.predict(
             source=frame,
@@ -169,7 +240,7 @@ class VisionNode(Node):
     def _to_detection2d_array(self, results, img_w: int, img_h: int) -> Detection2DArray:
         out = Detection2DArray()
 
-        if not results or len(results) == 0:
+        if not results:
             return out
 
         r0 = results[0]
@@ -214,11 +285,8 @@ class VisionNode(Node):
         return out
 
     def destroy_node(self):
-        try:
-            if hasattr(self, "cap") and self.cap is not None:
-                self.cap.release()
-        except Exception:
-            pass
+        self.enabled = False
+        self._release_camera()
         super().destroy_node()
 
 
