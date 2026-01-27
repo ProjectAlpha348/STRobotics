@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
+import time
+import threading
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, Bool
 
 
 class HeadOrchestrator(Node):
-    VALID_STATES = ("idle", "observe", "listen", "speak", "demo","exit","spegniti","spegni")
+    VALID_STATES = ("idle", "observe", "listen", "speak", "demo", "exit", "spegniti", "spegni")
 
     def __init__(self):
         super().__init__("head_orchestrator")
@@ -21,8 +24,15 @@ class HeadOrchestrator(Node):
         self.declare_parameter("speech_say_topic", "/tommy/speech/say")
         self.declare_parameter("tts_state_topic", "/tommy/voice/state")
         self.declare_parameter("voice_cmd_topic", "/tommy/voice/cmd")
-        self.declare_parameter("vision_enable_topic", "/tommy/vision/enable")
 
+        # Vision
+        self.declare_parameter("vision_enable_topic", "/tommy/vision/enable")
+        self.declare_parameter("vision_state_topic", "/tommy/vision/state")
+        self.declare_parameter("vision_idle_value", "idle")
+        self.declare_parameter("vision_idle_timeout_s", 5.0)
+        self.declare_parameter("voice_text_topic", "/tommy/voice/text")
+
+        voice_text_topic = self.get_parameter("voice_text_topic").value
         self.eyes_cmd_topic = str(self.get_parameter("eyes_cmd_topic").value)
         self.mode_topic = str(self.get_parameter("mode_topic").value)
         self.listen_resume_delay_ms = int(self.get_parameter("listen_resume_delay_ms").value)
@@ -30,7 +40,11 @@ class HeadOrchestrator(Node):
         self.speech_say_topic = str(self.get_parameter("speech_say_topic").value)
         self.tts_state_topic = str(self.get_parameter("tts_state_topic").value)
         self.voice_cmd_topic = str(self.get_parameter("voice_cmd_topic").value)
+
         self.vision_enable_topic = str(self.get_parameter("vision_enable_topic").value)
+        self.vision_state_topic = str(self.get_parameter("vision_state_topic").value)
+        self.vision_idle_value = str(self.get_parameter("vision_idle_value").value).strip().lower()
+        self.vision_idle_timeout_s = float(self.get_parameter("vision_idle_timeout_s").value)
 
         default_state = str(self.get_parameter("default_state").value).strip().lower()
         if default_state not in self.VALID_STATES:
@@ -43,6 +57,14 @@ class HeadOrchestrator(Node):
         self.want_listen = False
         self._resume_timer = None
 
+        # Vision state cache
+        self.vision_state = self.vision_idle_value
+
+        # Exit orchestration
+        self.exit_requested = False
+        self._exit_lock = threading.Lock()
+        self._exit_timer = None
+
         # ---------------- ROS interfaces ----------------
         self.cmd_sub = self.create_subscription(String, "/head/cmd", self.cmd_callback, 10)
         self.sys_cmd_pub = self.create_publisher(String, "/robot_head/system/cmd", 10)
@@ -50,8 +72,17 @@ class HeadOrchestrator(Node):
         self.state_pub = self.create_publisher(String, "/head/state", 10)
         self.mode_pub = self.create_publisher(String, self.mode_topic, 10)
 
+        # Questo topic viene usato anche come controllo voice_node (start/stop)
         self.voice_cmd_pub = self.create_publisher(String, self.voice_cmd_topic, 10)
+
+        # Ma lo ascoltiamo anche per i comandi vocali "guarda/stop visione/uscita"
+        #self.voice_cmd_sub = self.create_subscription(String, self.voice_cmd_topic, self.on_voice_cmd, 10)
+        
+        self.voice_text_sub = self.create_subscription(String,voice_text_topic,self.on_voice_cmd,10)
+
+
         self.vision_enable_pub = self.create_publisher(Bool, self.vision_enable_topic, 10)
+        self.vision_state_sub = self.create_subscription(String, self.vision_state_topic, self.on_vision_state, 10)
 
         self.eyes_cmd_pub = self.create_publisher(String, self.eyes_cmd_topic, 10)
 
@@ -69,8 +100,38 @@ class HeadOrchestrator(Node):
 
         self.get_logger().info(
             f"HeadOrchestrator avviato (state={self.current_state}) "
-            f"speech_say_topic={self.speech_say_topic} tts_state_topic={self.tts_state_topic}"
+            f"speech_say_topic={self.speech_say_topic} tts_state_topic={self.tts_state_topic} "
+            f"vision_enable_topic={self.vision_enable_topic} vision_state_topic={self.vision_state_topic}"
         )
+
+    # ---------------- Small helpers ----------------
+    @staticmethod
+    def _norm(s: str) -> str:
+        return (s or "").strip().lower()
+
+    def _one_shot(self, delay_s: float, cb):
+        """
+        rclpy Timer è periodico: per fare "one-shot" lo cancelliamo dentro la callback.
+        """
+        if self._exit_timer is not None:
+            try:
+                self._exit_timer.cancel()
+            except Exception:
+                pass
+            self._exit_timer = None
+
+        def _wrapped():
+            try:
+                cb()
+            finally:
+                if self._exit_timer is not None:
+                    try:
+                        self._exit_timer.cancel()
+                    except Exception:
+                        pass
+                    self._exit_timer = None
+
+        self._exit_timer = self.create_timer(max(0.0, float(delay_s)), _wrapped)
 
     # ---------------- Publish helpers ----------------
     def publish_state(self):
@@ -183,40 +244,116 @@ class HeadOrchestrator(Node):
             self.apply_mode("speaking" if self.tts_speaking else "listening")
             return
 
+    # ---------------- Voice commands (NEW) ----------------
+    def on_voice_cmd(self, msg: String):
+        """
+        Comandi vocali richiesti:
+          - guarda        -> vision_enable True
+          - stop visione  -> vision_enable False
+          - uscita        -> shutdown coordinato (attesa vision idle)
+
+        Sullo stesso topic ci transitano anche i comandi tecnici start/stop per il voice_node:
+        li ignoriamo qui.
+        """
+        cmd = self._norm(msg.data)
+        if not cmd:
+            return
+
+        # Ignora i comandi tecnici che noi stessi pubblichiamo per il voice_node
+        if cmd in ("start", "stop"):
+            return
+
+        if cmd == "guarda":
+            self.get_logger().info("Vocale: 'guarda' -> abilito visione")
+            self._pub_vision_enable(True)
+            return
+
+        if cmd == "stoppa visione":
+            self.get_logger().info("Vocale: 'stoppa visione' -> disabilito visione")
+            self._pub_vision_enable(False)
+            return
+
+        if cmd == "uscita":
+            self.get_logger().info("Vocale: 'uscita' -> spegnimento coordinato")
+            self._request_exit(source="voice")
+            return
+
+        # altri comandi vocali ignorati
+        return
+
+    # ---------------- Vision state (NEW) ----------------
+    def on_vision_state(self, msg: String):
+        self.vision_state = self._norm(msg.data) or self.vision_state
+        # log a basso rumore: solo se serve, qui lasciamo info semplice
+        self.get_logger().debug(f"Vision state='{self.vision_state}'")
+
+    # ---------------- Coordinated shutdown (UPDATED) ----------------
+    def _request_exit(self, source: str = "cmd"):
+        with self._exit_lock:
+            if self.exit_requested:
+                self.get_logger().warn("Uscita già richiesta, ignoro.")
+                return
+            self.exit_requested = True
+
+        threading.Thread(target=self._graceful_shutdown, args=(source,), daemon=True).start()
+
+    def _graceful_shutdown(self, source: str):
+        self.get_logger().info(f"EXIT: avvio sequenza (source={source})")
+
+        # 1) Occhi: animazione e stop
+        self._pub_eyes_cmd("state=stop")
+
+        # 2) Stop ascolto subito
+        self._pub_voice_cmd("stop")
+
+        # 3) Disabilita visione e ATTENDI idle prima di shutdown sistema
+        self._pub_vision_enable(False)
+
+        t0 = time.time()
+        while self.vision_state != self.vision_idle_value:
+            if (time.time() - t0) > self.vision_idle_timeout_s:
+                self.get_logger().warn(
+                    f"EXIT: timeout attesa vision idle ({self.vision_idle_timeout_s:.1f}s). "
+                    f"Ultimo state='{self.vision_state}'. Proseguo comunque."
+                )
+                break
+            time.sleep(0.1)
+
+        if self.vision_state == self.vision_idle_value:
+            self.get_logger().info("EXIT: vision idle confermato")
+
+        # 4) Ora chiedi al sistema di chiudere gli altri nodi (vision rilascia camera, ecc.)
+        self.sys_cmd_pub.publish(String(data="shutdown"))
+
+        # 5) Dai tempo all’animazione occhi (one-shot) poi chiudi orchestrator
+        def _finalize():
+            self.get_logger().info("EXIT: chiusura orchestrator.")
+            try:
+                self.destroy_node()
+            finally:
+                rclpy.shutdown()
+
+        self._one_shot(0.9, _finalize)
+
     # ---------------- Callbacks ----------------
     def cmd_callback(self, msg: String):
         cmd = (msg.data or "").strip().lower()
         if cmd not in self.VALID_STATES:
             self.get_logger().warn(f"Comando non valido su /head/cmd: '{msg.data}'")
             return
-        if cmd in ("exit", "shutdown", "spegni"):
-            self.get_logger().info("Comando EXIT: spegnimento coordinato.")
 
-            # 1) occhi: animazione e stop
-            self._pub_eyes_cmd("state=stop")
-
-            # 2) rilascia camera + chiudi nodi
-            self.sys_cmd_pub.publish(String(data="shutdown"))
-
-            # 3) safety: stop voice subito (se vuoi immediato)
-            self._pub_voice_cmd("stop")
-
-            # 4) dai tempo all’animazione occhi (opzionale ma consigliato)
-            def _finalize():
-                self.get_logger().info("Chiusura orchestrator.")
-                self.destroy_node()
-                rclpy.shutdown()
-
-            # one-shot timer (es. 0.9s) per far finire animazione
-            self.create_timer(0.9, _finalize)
+        if cmd in ("exit", "shutdown", "spegni", "spegniti"):
+            self.get_logger().info("Comando EXIT: spegnimento coordinato (attesa vision idle).")
+            self._request_exit(source="/head/cmd")
             return
+
         self.current_state = cmd
         self.get_logger().info(f"Nuovo stato: {self.current_state}")
         self.publish_state()
         self.apply_policy(self.current_state)
 
     def on_tts_state(self, msg: String):
-        # speak_node pubblica: 'speaking' o 'idle' :contentReference[oaicite:1]{index=1}
+        # speak_node pubblica: 'speaking' o 'idle'
         s = (msg.data or "").strip().lower()
         if s not in ("speaking", "idle"):
             return
@@ -269,8 +406,12 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

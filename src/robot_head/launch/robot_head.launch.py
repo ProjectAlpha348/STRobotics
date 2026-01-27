@@ -166,6 +166,7 @@ def generate_launch_description():
         DeclareLaunchArgument("enable_partial", default_value="false"),
         DeclareLaunchArgument("min_text_len", default_value="2"),
         DeclareLaunchArgument("resample_to_vosk_rate", default_value="true"),
+        DeclareLaunchArgument("voice_text_topic",default_value="/tommy/voice/text"),
 
         # Orchestrator/Eyes topics
         DeclareLaunchArgument("eyes_cmd_topic", default_value="/robot_head/eyes/cmd"),
