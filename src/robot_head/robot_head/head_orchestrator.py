@@ -23,8 +23,7 @@ class HeadOrchestrator(Node):
         # Speak (allineati al tuo speak_node)
         self.declare_parameter("speech_say_topic", "/tommy/speech/say")
 
-        # FIX: nel tuo file era /tommy/voice/state (non coerente con la tua architettura)
-        # Qui metto un default più sensato. Se il tuo speak_node usa un altro topic, puoi sovrascriverlo da launch.
+        # Stato TTS
         self.declare_parameter("tts_state_topic", "/robot/tts/state")
 
         # Voice control
@@ -322,7 +321,6 @@ class HeadOrchestrator(Node):
             self.last_hum = h
             self.last_env_ts = time.time()
         except Exception:
-            # niente spam: se formato errato lo ignoriamo
             pass
 
     def _env_is_fresh(self) -> bool:
@@ -330,26 +328,34 @@ class HeadOrchestrator(Node):
             return False
         return (time.time() - float(self.last_env_ts or 0.0)) <= self.env_stale_timeout_s
 
+    # ---------------- FIX: forza passaggio in listen dopo risposta "temperatura" ----------------
+    def _force_listen_state(self):
+        """
+        Se l'utente chiede "temperatura" mentre siamo in idle/observe/speak,
+        vogliamo tornare ad ascoltare automaticamente dopo la risposta TTS.
+        La tua 'versione funzionante' richiedeva di pubblicare listen manualmente:
+        qui lo facciamo noi, in modo controllato.
+        """
+        if self.current_state not in ("listen", "demo"):
+            self.current_state = "listen"
+            self.publish_state()
+            self.apply_policy(self.current_state)
+
     def _handle_temp_request(self):
-        # se siamo in listen/demo, vogliamo tornare ad ascoltare dopo la frase
-        # (want_listen già True in quei mode)
         if not self._env_is_fresh():
             self.say("Non ho ancora i dati dei sensori. Aspetta un attimo e riprova.")
             return
 
         t = float(self.last_temp)
         h = float(self.last_hum)
+
+        # FIX: prima di parlare, settiamo la politica su listen così al TTS=idle riparte il mic
+        self._force_listen_state()
+
         self.say(f"La temperatura è di {t:.1f} gradi, con un'umidità del {h:.0f} per cento.")
 
-    # ---------------- Voice commands (UPDATED) ----------------
+    # ---------------- Voice commands ----------------
     def on_voice_cmd(self, msg: String):
-        """
-        Comandi vocali:
-          - guarda          -> vision_enable True
-          - stoppa visione  -> vision_enable False
-          - uscita          -> shutdown coordinato (attesa vision idle)
-          - temp/temperatura/umidità -> risposta vocale con T e U
-        """
         cmd = self._norm(msg.data)
         if not cmd:
             return
@@ -373,14 +379,11 @@ class HeadOrchestrator(Node):
             self._request_exit(source="voice")
             return
 
-        # TEMP (match semplice ma efficace: include "temperatura" dai tuoi log)
         if cmd in ("temp", "temperatura", "umidità", "umidita"):
             self.get_logger().info("Vocale: 'temp/temperatura' -> rispondo con T e U")
-            # assicura che il fallback ripristini ascolto: ha senso solo se sei in listen/demo
             self._handle_temp_request()
             return
 
-        # altri comandi vocali ignorati
         return
 
     # ---------------- Vision state ----------------
@@ -400,13 +403,8 @@ class HeadOrchestrator(Node):
     def _graceful_shutdown(self, source: str):
         self.get_logger().info(f"EXIT: avvio sequenza (source={source})")
 
-        # 1) Occhi: animazione e stop
         self._pub_eyes_cmd("state=stop")
-
-        # 2) Stop ascolto subito
         self._pub_voice_cmd("stop")
-
-        # 3) Disabilita visione e ATTENDI idle prima di shutdown sistema
         self._pub_vision_enable(False)
 
         t0 = time.time()
@@ -422,10 +420,8 @@ class HeadOrchestrator(Node):
         if self.vision_state == self.vision_idle_value:
             self.get_logger().info("EXIT: vision idle confermato")
 
-        # 4) Shutdown coordinato
         self.sys_cmd_pub.publish(String(data="shutdown"))
 
-        # 5) Dai tempo all’animazione occhi poi chiudi orchestrator
         def _finalize():
             self.get_logger().info("EXIT: chiusura orchestrator.")
             try:
@@ -453,9 +449,6 @@ class HeadOrchestrator(Node):
         self.apply_policy(self.current_state)
 
     def on_tts_state(self, msg: String):
-        """
-        speak_node dovrebbe pubblicare: 'speaking' o 'idle'
-        """
         s = (msg.data or "").strip().lower()
         if s not in ("speaking", "idle"):
             return
@@ -464,16 +457,12 @@ class HeadOrchestrator(Node):
         self.tts_speaking = (s == "speaking")
 
         if self.tts_speaking and not was:
-            # speaking blocca ascolto
             self.get_logger().info("TTS=speaking -> mode=speaking")
             self._cancel_resume_timer()
-            # quando arriva speaking, il fallback è comunque armato: va bene, ma possiamo disarmarlo
-            # e riarmarlo solo se serve su idle; però lasciarlo non rompe (timer one-shot).
             self.apply_mode("speaking")
             return
 
         if (not self.tts_speaking) and was:
-            # idle -> ripristino ascolto (se in listen/demo)
             self.get_logger().info("TTS=idle -> ripristino")
             self._cancel_tts_fallback()
             if self.want_listen:
