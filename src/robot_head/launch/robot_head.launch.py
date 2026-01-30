@@ -27,6 +27,7 @@ def generate_launch_description():
     enable_partial = LaunchConfiguration("enable_partial")
     min_text_len = LaunchConfiguration("min_text_len")
     resample_to_vosk_rate = LaunchConfiguration("resample_to_vosk_rate")
+    voice_text_topic = LaunchConfiguration("voice_text_topic")
 
     # ---------------- Launch args (Orchestrator/Eyes) ----------------
     eyes_cmd_topic = LaunchConfiguration("eyes_cmd_topic")
@@ -39,6 +40,15 @@ def generate_launch_description():
     tts_state_topic = LaunchConfiguration("tts_state_topic")
     voice_cmd_topic = LaunchConfiguration("voice_cmd_topic")
     vision_enable_topic = LaunchConfiguration("vision_enable_topic")
+
+    # ---------------- Launch args (Sensors) ----------------
+    env_topic = LaunchConfiguration("env_topic")
+    i2c_address = LaunchConfiguration("i2c_address")
+    env_update_hz = LaunchConfiguration("env_update_hz")
+    env_stale_timeout_s = LaunchConfiguration("env_stale_timeout_s")
+
+    # Orchestrator fallback (se lo stato TTS è intermittente)
+    tts_fallback_resume_s = LaunchConfiguration("tts_fallback_resume_s")
 
     # ---------------- Launch args (Eyes hardware) ----------------
     i2c_bus = LaunchConfiguration("i2c_bus")
@@ -86,8 +96,22 @@ def generate_launch_description():
             "enable_partial": enable_partial,
             "min_text_len": min_text_len,
             "resample_to_vosk_rate": resample_to_vosk_rate,
-            # Se nel voice_node usi cmd_topic parametrico:
-            # "cmd_topic": voice_cmd_topic,
+
+            # (facoltativo) se vuoi usare questo topic anche dentro voice_node in futuro
+            # "text_topic": voice_text_topic,
+        }],
+    )
+
+    # NEW: sensore ambiente (BME280) -> pubblica /tommy/sensors/env
+    environment_node = Node(
+        package="robot_head",
+        executable="environment_node",
+        name="environment",
+        output="screen",
+        parameters=[{
+            "i2c_address": i2c_address,
+            "update_hz": env_update_hz,
+            "env_topic": env_topic,
         }],
     )
 
@@ -96,7 +120,6 @@ def generate_launch_description():
         executable="speak_node",
         name="speak",
         output="screen",
-        # Se il tuo speak_node NON supporta parametri, puoi lasciare vuoto.
         # parameters=[{"say_topic": speech_say_topic, "state_topic": tts_state_topic}],
     )
 
@@ -129,10 +152,21 @@ def generate_launch_description():
             "mode_topic": mode_topic,
             "listen_resume_delay_ms": listen_resume_delay_ms,
             "default_state": default_state,
+
             "speech_say_topic": speech_say_topic,
             "tts_state_topic": tts_state_topic,
             "voice_cmd_topic": voice_cmd_topic,
             "vision_enable_topic": vision_enable_topic,
+
+            # allineamento: il tuo orchestrator usa /tommy/voice/text
+            "voice_text_topic": voice_text_topic,
+
+            # sensori
+            "env_topic": env_topic,
+            "env_stale_timeout_s": env_stale_timeout_s,
+
+            # fallback ripartenza ascolto
+            "tts_fallback_resume_s": tts_fallback_resume_s,
         }],
     )
 
@@ -166,7 +200,7 @@ def generate_launch_description():
         DeclareLaunchArgument("enable_partial", default_value="false"),
         DeclareLaunchArgument("min_text_len", default_value="2"),
         DeclareLaunchArgument("resample_to_vosk_rate", default_value="true"),
-        DeclareLaunchArgument("voice_text_topic",default_value="/tommy/voice/text"),
+        DeclareLaunchArgument("voice_text_topic", default_value="/tommy/voice/text"),
 
         # Orchestrator/Eyes topics
         DeclareLaunchArgument("eyes_cmd_topic", default_value="/robot_head/eyes/cmd"),
@@ -174,11 +208,24 @@ def generate_launch_description():
         DeclareLaunchArgument("listen_resume_delay_ms", default_value="250"),
         DeclareLaunchArgument("default_state", default_value="idle"),
 
-        # Speak/Voice/Vision topics (allineati al tuo speak_node attuale)
+        # Speak/Voice/Vision topics
         DeclareLaunchArgument("speech_say_topic", default_value="/tommy/speech/say"),
-        DeclareLaunchArgument("tts_state_topic", default_value="/tommy/voice/state"),
+
+        # IMPORTANT: qui tieni il topic che davvero pubblica speaking/idle
+        # Nel tuo sistema dai log sembra funzionare. Se serve, lo cambi qui.
+        DeclareLaunchArgument("tts_state_topic", default_value="/robot/tts/state"),
+
         DeclareLaunchArgument("voice_cmd_topic", default_value="/tommy/voice/cmd"),
         DeclareLaunchArgument("vision_enable_topic", default_value="/tommy/vision/enable"),
+
+        # Sensors args
+        DeclareLaunchArgument("env_topic", default_value="/tommy/sensors/env"),
+        DeclareLaunchArgument("i2c_address", default_value="118"),  # 0x76 = 118
+        DeclareLaunchArgument("env_update_hz", default_value="2.0"),
+        DeclareLaunchArgument("env_stale_timeout_s", default_value="30.0"),
+
+        # Orchestrator fallback
+        DeclareLaunchArgument("tts_fallback_resume_s", default_value="20.0"),
 
         # Eyes hardware
         DeclareLaunchArgument("i2c_bus", default_value="1"),
@@ -193,9 +240,10 @@ def generate_launch_description():
         DeclareLaunchArgument("blink_min_s", default_value="3.0"),
         DeclareLaunchArgument("blink_max_s", default_value="7.0"),
 
-        # Nodes
+        # Nodes (ordine: sensore prima dell’orchestrator)
         vision_node,
         voice_node,
+        environment_node,
         speak_node,
         eyes_node,
         orchestrator_node,
@@ -203,4 +251,3 @@ def generate_launch_description():
         # Shutdown behavior
         shutdown_on_orchestrator_exit,
     ])
-

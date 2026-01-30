@@ -10,6 +10,7 @@
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>interface</depend>  
   <depend>goemetry_msgs</depend>
   <depend>vision_msgs</depend>
   <depend>ament_index_python</depend>

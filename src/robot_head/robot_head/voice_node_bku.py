@@ -4,7 +4,7 @@ import queue
 import threading
 import time
 import audioop
-from typing import Optional, List
+from typing import Optional
 
 import rclpy
 from rclpy.node import Node
@@ -35,12 +35,6 @@ class VoiceNode(Node):
         self.declare_parameter('min_text_len', 2)
         self.declare_parameter('resample_to_vosk_rate', True)
 
-        # ---- Intent parsing (NUOVO) ----
-        # Se True, pubblica intenti su /tommy/voice/intent (es. "temp")
-        self.declare_parameter('enable_intents', True)
-        # Keyword che attivano il comando "temp"
-        self.declare_parameter('temp_keywords', ['temp', 'temperatura', 'che temperatura', 'umidità', 'umidita'])
-
         pkg_share = get_package_share_directory('robot_head')
         vosk_model_rel = self.get_parameter('vosk_model_rel').value
         model_path_override = (self.get_parameter('model_path').value or "").strip()
@@ -55,10 +49,6 @@ class VoiceNode(Node):
         self.auto_start = bool(self.get_parameter('auto_start').value)
         self.min_text_len = int(self.get_parameter('min_text_len').value)
         self.do_resample = bool(self.get_parameter('resample_to_vosk_rate').value)
-
-        # Intent params
-        self.enable_intents = bool(self.get_parameter('enable_intents').value)
-        self.temp_keywords: List[str] = [str(x).strip().lower() for x in self.get_parameter('temp_keywords').value]
 
         if self.channels != 1:
             raise RuntimeError("Questo nodo è configurato per audio mono (channels=1).")
@@ -86,10 +76,6 @@ class VoiceNode(Node):
         self.pub_text = self.create_publisher(String, '/tommy/voice/text', 10)
         self.pub_partial = self.create_publisher(String, '/tommy/voice/partial', 10) if self.enable_partial else None
         self.pub_status = self.create_publisher(String, '/tommy/voice/status', 10)
-
-        # NUOVO: intent publisher (NON usare /tommy/voice/cmd, che è di controllo!)
-        self.pub_intent = self.create_publisher(String, '/tommy/voice/intent', 10) if self.enable_intents else None
-
         self.sub_cmd = self.create_subscription(String, '/tommy/voice/cmd', self._on_cmd, 10)
         self.sys_sub = self.create_subscription(String, "/robot_head/system/cmd", self._on_system_cmd, 10)
 
@@ -114,7 +100,7 @@ class VoiceNode(Node):
     def _on_system_cmd(self, msg):
         if msg.data.strip().lower() == "shutdown":
             self.get_logger().info("Shutdown richiesto: stop ascolto e chiusura.")
-            self.stop_listening()
+            self.stop_listening()   # la tua funzione esistente
             self.destroy_node()
             rclpy.shutdown()
 
@@ -122,7 +108,7 @@ class VoiceNode(Node):
         cmd = (msg.data or "").strip().lower()
         if not cmd:
             return
-
+        
         if cmd == "start":
             self.start_listening()
         elif cmd == "stop":
@@ -215,34 +201,6 @@ class VoiceNode(Node):
         )
         return converted
 
-    def _maybe_publish_intent(self, text: str):
-        """
-        Regole semplici (keyword match) per generare intenti.
-        Pubblica su /tommy/voice/intent (String), es. "temp".
-        """
-        if not self.enable_intents or not self.pub_intent:
-            return
-
-        t = (text or "").strip().lower()
-        if not t:
-            return
-
-        # Match diretto o frase esatta in lista
-        if t in self.temp_keywords:
-            msg = String()
-            msg.data = "temp"
-            self.pub_intent.publish(msg)
-            return
-
-        # Match "contiene" per frasi tipo "mi dici la temperatura"
-        # (senza esagerare, per evitare falsi positivi)
-        for kw in self.temp_keywords:
-            if len(kw) >= 4 and kw in t:
-                msg = String()
-                msg.data = "temp"
-                self.pub_intent.publish(msg)
-                return
-
     def _worker_loop(self):
         last_partial = ""
 
@@ -272,10 +230,6 @@ class VoiceNode(Node):
                     out.data = text
                     self.pub_text.publish(out)
                     self.get_logger().info(f"STT: {text}")
-
-                    # NUOVO: pubblica intent (es. "temp") se matcha
-                    self._maybe_publish_intent(text)
-
                 last_partial = ""
             else:
                 if self.enable_partial and self.pub_partial:

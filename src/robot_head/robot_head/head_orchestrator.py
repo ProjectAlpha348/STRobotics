@@ -20,19 +20,33 @@ class HeadOrchestrator(Node):
         self.declare_parameter("listen_resume_delay_ms", 250)
         self.declare_parameter("default_state", "idle")
 
-        # Topics (allineati al tuo speak_node)
+        # Speak (allineati al tuo speak_node)
         self.declare_parameter("speech_say_topic", "/tommy/speech/say")
-        self.declare_parameter("tts_state_topic", "/tommy/voice/state")
+
+        # FIX: nel tuo file era /tommy/voice/state (non coerente con la tua architettura)
+        # Qui metto un default più sensato. Se il tuo speak_node usa un altro topic, puoi sovrascriverlo da launch.
+        self.declare_parameter("tts_state_topic", "/robot/tts/state")
+
+        # Voice control
         self.declare_parameter("voice_cmd_topic", "/tommy/voice/cmd")
+        self.declare_parameter("voice_text_topic", "/tommy/voice/text")
+
+        # Sensori ambiente (String: "temp=23.4;hum=48.2")
+        self.declare_parameter("env_topic", "/tommy/sensors/env")
+        self.declare_parameter("env_stale_timeout_s", 30.0)
+
+        # Fallback: se non arriva mai lo stato TTS, riavvia ascolto dopo N secondi
+        self.declare_parameter("tts_fallback_resume_s", 20.0)
 
         # Vision
         self.declare_parameter("vision_enable_topic", "/tommy/vision/enable")
         self.declare_parameter("vision_state_topic", "/tommy/vision/state")
         self.declare_parameter("vision_idle_value", "idle")
         self.declare_parameter("vision_idle_timeout_s", 5.0)
-        self.declare_parameter("voice_text_topic", "/tommy/voice/text")
 
-        voice_text_topic = self.get_parameter("voice_text_topic").value
+        # -------- Load params --------
+        voice_text_topic = str(self.get_parameter("voice_text_topic").value)
+
         self.eyes_cmd_topic = str(self.get_parameter("eyes_cmd_topic").value)
         self.mode_topic = str(self.get_parameter("mode_topic").value)
         self.listen_resume_delay_ms = int(self.get_parameter("listen_resume_delay_ms").value)
@@ -40,6 +54,10 @@ class HeadOrchestrator(Node):
         self.speech_say_topic = str(self.get_parameter("speech_say_topic").value)
         self.tts_state_topic = str(self.get_parameter("tts_state_topic").value)
         self.voice_cmd_topic = str(self.get_parameter("voice_cmd_topic").value)
+
+        self.env_topic = str(self.get_parameter("env_topic").value)
+        self.env_stale_timeout_s = float(self.get_parameter("env_stale_timeout_s").value)
+        self.tts_fallback_resume_s = float(self.get_parameter("tts_fallback_resume_s").value)
 
         self.vision_enable_topic = str(self.get_parameter("vision_enable_topic").value)
         self.vision_state_topic = str(self.get_parameter("vision_state_topic").value)
@@ -57,6 +75,11 @@ class HeadOrchestrator(Node):
         self.want_listen = False
         self._resume_timer = None
 
+        # Cache sensori
+        self.last_temp = None
+        self.last_hum = None
+        self.last_env_ts = 0.0
+
         # Vision state cache
         self.vision_state = self.vision_idle_value
 
@@ -64,6 +87,10 @@ class HeadOrchestrator(Node):
         self.exit_requested = False
         self._exit_lock = threading.Lock()
         self._exit_timer = None
+
+        # Fallback timer TTS
+        self._tts_fallback_timer = None
+        self._tts_fallback_armed = False
 
         # ---------------- ROS interfaces ----------------
         self.cmd_sub = self.create_subscription(String, "/head/cmd", self.cmd_callback, 10)
@@ -75,15 +102,17 @@ class HeadOrchestrator(Node):
         # Questo topic viene usato anche come controllo voice_node (start/stop)
         self.voice_cmd_pub = self.create_publisher(String, self.voice_cmd_topic, 10)
 
-        # Ma lo ascoltiamo anche per i comandi vocali "guarda/stop visione/uscita"
-        #self.voice_cmd_sub = self.create_subscription(String, self.voice_cmd_topic, self.on_voice_cmd, 10)
-        
-        self.voice_text_sub = self.create_subscription(String,voice_text_topic,self.on_voice_cmd,10)
+        # Comandi vocali dal testo riconosciuto (STT)
+        self.voice_text_sub = self.create_subscription(String, voice_text_topic, self.on_voice_cmd, 10)
 
+        # Sensori ambiente
+        self.env_sub = self.create_subscription(String, self.env_topic, self.on_env, 10)
 
+        # Vision
         self.vision_enable_pub = self.create_publisher(Bool, self.vision_enable_topic, 10)
         self.vision_state_sub = self.create_subscription(String, self.vision_state_topic, self.on_vision_state, 10)
 
+        # Eyes
         self.eyes_cmd_pub = self.create_publisher(String, self.eyes_cmd_topic, 10)
 
         # Publisher verso speak_node
@@ -101,6 +130,7 @@ class HeadOrchestrator(Node):
         self.get_logger().info(
             f"HeadOrchestrator avviato (state={self.current_state}) "
             f"speech_say_topic={self.speech_say_topic} tts_state_topic={self.tts_state_topic} "
+            f"voice_text_topic={voice_text_topic} env_topic={self.env_topic} "
             f"vision_enable_topic={self.vision_enable_topic} vision_state_topic={self.vision_state_topic}"
         )
 
@@ -149,13 +179,46 @@ class HeadOrchestrator(Node):
     def _pub_eyes_cmd(self, s: str):
         self.eyes_cmd_pub.publish(String(data=s))
 
+    # ---------------- TTS fallback resume ----------------
+    def _cancel_tts_fallback(self):
+        if self._tts_fallback_timer is not None:
+            try:
+                self._tts_fallback_timer.cancel()
+            except Exception:
+                pass
+            self._tts_fallback_timer = None
+        self._tts_fallback_armed = False
+
+    def _arm_tts_fallback(self):
+        """
+        Se il topic di stato TTS non arriva (o arriva tardi), questo timer riattiva l'ascolto.
+        """
+        self._cancel_tts_fallback()
+        if self.tts_fallback_resume_s <= 0.0:
+            return
+
+        self._tts_fallback_armed = True
+
+        def _cb():
+            # one-shot
+            self._cancel_tts_fallback()
+
+            # Se vogliamo ascoltare (listen/demo) allora forziamo un resume
+            if self.want_listen and (not self.tts_speaking):
+                self.get_logger().warn("TTS fallback: riattivo ascolto (nessun idle ricevuto)")
+                self.apply_mode("listening")
+
+        self._tts_fallback_timer = self.create_timer(float(self.tts_fallback_resume_s), _cb)
+
     def say(self, text: str):
         text = (text or "").strip()
         if not text:
             return
-        # facoltativo: mostra “thinking” finché non parte speaking
-        if not self.tts_speaking:
-            self.apply_mode("thinking")
+
+        # entra in thinking (che stoppa il mic) e arma fallback
+        self.apply_mode("thinking")
+        self._arm_tts_fallback()
+
         self.speech_say_pub.publish(String(data=text))
 
     # ---------------- Mode table ----------------
@@ -233,7 +296,6 @@ class HeadOrchestrator(Node):
         if state == "speak":
             self.want_listen = False
             self._pub_vision_enable(True)
-            # In speak: non ascoltare
             self._pub_voice_cmd("stop")
             self.apply_mode("speaking" if self.tts_speaking else "thinking")
             return
@@ -244,23 +306,56 @@ class HeadOrchestrator(Node):
             self.apply_mode("speaking" if self.tts_speaking else "listening")
             return
 
-    # ---------------- Voice commands (NEW) ----------------
+    # ---------------- Sensors ----------------
+    def on_env(self, msg: String):
+        """
+        Atteso: "temp=23.4;hum=48.2"
+        """
+        s = (msg.data or "").strip()
+        if not s:
+            return
+        try:
+            parts = dict(x.split("=", 1) for x in s.split(";") if "=" in x)
+            t = float(parts.get("temp"))
+            h = float(parts.get("hum"))
+            self.last_temp = t
+            self.last_hum = h
+            self.last_env_ts = time.time()
+        except Exception:
+            # niente spam: se formato errato lo ignoriamo
+            pass
+
+    def _env_is_fresh(self) -> bool:
+        if self.last_temp is None or self.last_hum is None:
+            return False
+        return (time.time() - float(self.last_env_ts or 0.0)) <= self.env_stale_timeout_s
+
+    def _handle_temp_request(self):
+        # se siamo in listen/demo, vogliamo tornare ad ascoltare dopo la frase
+        # (want_listen già True in quei mode)
+        if not self._env_is_fresh():
+            self.say("Non ho ancora i dati dei sensori. Aspetta un attimo e riprova.")
+            return
+
+        t = float(self.last_temp)
+        h = float(self.last_hum)
+        self.say(f"La temperatura è di {t:.1f} gradi, con un'umidità del {h:.0f} per cento.")
+
+    # ---------------- Voice commands (UPDATED) ----------------
     def on_voice_cmd(self, msg: String):
         """
-        Comandi vocali richiesti:
-          - guarda        -> vision_enable True
-          - stop visione  -> vision_enable False
-          - uscita        -> shutdown coordinato (attesa vision idle)
-
-        Sullo stesso topic ci transitano anche i comandi tecnici start/stop per il voice_node:
-        li ignoriamo qui.
+        Comandi vocali:
+          - guarda          -> vision_enable True
+          - stoppa visione  -> vision_enable False
+          - uscita          -> shutdown coordinato (attesa vision idle)
+          - temp/temperatura/umidità -> risposta vocale con T e U
         """
         cmd = self._norm(msg.data)
         if not cmd:
             return
 
         # Ignora i comandi tecnici che noi stessi pubblichiamo per il voice_node
-        if cmd in ("start", "stop"):
+        if cmd in ("start", "stop", "toggle", "status"):
             return
 
         if cmd == "guarda":
@@ -278,16 +373,21 @@ class HeadOrchestrator(Node):
             self._request_exit(source="voice")
             return
 
+        # TEMP (match semplice ma efficace: include "temperatura" dai tuoi log)
+        if cmd in ("temp", "temperatura", "umidità", "umidita"):
+            self.get_logger().info("Vocale: 'temp/temperatura' -> rispondo con T e U")
+            # assicura che il fallback ripristini ascolto: ha senso solo se sei in listen/demo
+            self._handle_temp_request()
+            return
+
         # altri comandi vocali ignorati
         return
 
-    # ---------------- Vision state (NEW) ----------------
+    # ---------------- Vision state ----------------
     def on_vision_state(self, msg: String):
         self.vision_state = self._norm(msg.data) or self.vision_state
-        # log a basso rumore: solo se serve, qui lasciamo info semplice
-        self.get_logger().debug(f"Vision state='{self.vision_state}'")
 
-    # ---------------- Coordinated shutdown (UPDATED) ----------------
+    # ---------------- Coordinated shutdown ----------------
     def _request_exit(self, source: str = "cmd"):
         with self._exit_lock:
             if self.exit_requested:
@@ -322,10 +422,10 @@ class HeadOrchestrator(Node):
         if self.vision_state == self.vision_idle_value:
             self.get_logger().info("EXIT: vision idle confermato")
 
-        # 4) Ora chiedi al sistema di chiudere gli altri nodi (vision rilascia camera, ecc.)
+        # 4) Shutdown coordinato
         self.sys_cmd_pub.publish(String(data="shutdown"))
 
-        # 5) Dai tempo all’animazione occhi (one-shot) poi chiudi orchestrator
+        # 5) Dai tempo all’animazione occhi poi chiudi orchestrator
         def _finalize():
             self.get_logger().info("EXIT: chiusura orchestrator.")
             try:
@@ -353,7 +453,9 @@ class HeadOrchestrator(Node):
         self.apply_policy(self.current_state)
 
     def on_tts_state(self, msg: String):
-        # speak_node pubblica: 'speaking' o 'idle'
+        """
+        speak_node dovrebbe pubblicare: 'speaking' o 'idle'
+        """
         s = (msg.data or "").strip().lower()
         if s not in ("speaking", "idle"):
             return
@@ -362,15 +464,18 @@ class HeadOrchestrator(Node):
         self.tts_speaking = (s == "speaking")
 
         if self.tts_speaking and not was:
-            # Priorità: speaking blocca ascolto
+            # speaking blocca ascolto
             self.get_logger().info("TTS=speaking -> mode=speaking")
             self._cancel_resume_timer()
+            # quando arriva speaking, il fallback è comunque armato: va bene, ma possiamo disarmarlo
+            # e riarmarlo solo se serve su idle; però lasciarlo non rompe (timer one-shot).
             self.apply_mode("speaking")
             return
 
         if (not self.tts_speaking) and was:
-            # Fine speaking -> ripristina, con delay se vogliamo ascoltare
+            # idle -> ripristino ascolto (se in listen/demo)
             self.get_logger().info("TTS=idle -> ripristino")
+            self._cancel_tts_fallback()
             if self.want_listen:
                 self._schedule_resume_listen()
             else:

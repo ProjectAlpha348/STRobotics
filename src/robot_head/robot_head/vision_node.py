@@ -55,6 +55,10 @@ class VisionNode(Node):
 
         self.declare_parameter("model_relpath", "models/yolo/yolov8n.pt")
 
+        # ---- NEW: OpenCV window (showimage)
+        self.declare_parameter("show_window", True)
+        self.declare_parameter("window_name", "Tommy - Vision (YOLO)")
+
         self.camera_index = int(self.get_parameter("camera_index").value)
         self.camera_device = str(self.get_parameter("camera_device").value)
         self.w = int(self.get_parameter("image_width").value)
@@ -68,6 +72,11 @@ class VisionNode(Node):
         self.rate_hz = float(self.get_parameter("rate_hz").value)
         if self.rate_hz <= 0:
             self.rate_hz = 30.0
+
+        # ---- NEW
+        self.show_window = bool(self.get_parameter("show_window").value)
+        self.window_name = str(self.get_parameter("window_name").value)
+        self._window_open = False
 
         # ---------------- Model path
         share = get_package_share_directory("robot_head")
@@ -103,6 +112,7 @@ class VisionNode(Node):
         if self.enabled:
             try:
                 self._ensure_camera_open()
+                self._ensure_window_open()
                 self._publish_state("running")
             except Exception as e:
                 self.get_logger().warning(f"Camera non disponibile all'avvio: {e}")
@@ -120,6 +130,29 @@ class VisionNode(Node):
         m = String()
         m.data = self._state
         self.pub_state.publish(m)
+
+    # ----------------- Window helpers (NEW)
+    def _ensure_window_open(self):
+        if not self.show_window:
+            return
+        if self._window_open:
+            return
+        # Se non c'è display (headless), imshow potrebbe fallire: gestiamo con try/except.
+        try:
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            self._window_open = True
+        except Exception as e:
+            self.get_logger().warning(f"Impossibile creare finestra OpenCV (headless?): {e}")
+            self._window_open = False
+
+    def _close_window(self):
+        if not self._window_open:
+            return
+        try:
+            cv2.destroyWindow(self.window_name)
+        except Exception:
+            pass
+        self._window_open = False
 
     # ----------------- Camera helpers
     def _ensure_camera_open(self):
@@ -149,13 +182,15 @@ class VisionNode(Node):
         self.get_logger().info(f"Vision enable = {self.enabled}")
 
         if not self.enabled:
-            # DISATTIVAZIONE REALE: rilascio immediato della webcam
+            # DISATTIVAZIONE REALE: rilascio immediato della webcam + chiusura finestra
             self._release_camera()
+            self._close_window()
             self._publish_state("idle")
         else:
-            # riattivazione: tenta riapertura
+            # riattivazione: tenta riapertura + riapri finestra
             try:
                 self._ensure_camera_open()
+                self._ensure_window_open()
                 self._publish_state("running")
             except Exception as e:
                 self.get_logger().warning(f"Impossibile riaprire camera: {e}")
@@ -172,6 +207,7 @@ class VisionNode(Node):
 
             self.enabled = False
             self._release_camera()
+            self._close_window()
 
             try:
                 cv2.destroyAllWindows()
@@ -193,6 +229,7 @@ class VisionNode(Node):
         if self.cap is None or not self.cap.isOpened():
             try:
                 self._ensure_camera_open()
+                self._ensure_window_open()
             except Exception as e:
                 self.get_logger().warn(f"Camera non disponibile: {e}")
                 self._publish_state("error")
@@ -202,6 +239,7 @@ class VisionNode(Node):
         if not ok or frame is None:
             self.get_logger().warn("Frame non disponibile (rilascio camera, stato=error).")
             self._release_camera()
+            self._close_window()
             self._publish_state("error")
             return
 
@@ -220,11 +258,26 @@ class VisionNode(Node):
         det_msg.header.frame_id = "camera_frame"
         self.pub_det.publish(det_msg)
 
-        if self.publish_annotated and self.pub_img.get_subscription_count() > 0:
+        annotated = None
+        if self.publish_annotated:
             annotated = results[0].plot()
-            img_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
-            img_msg.header = det_msg.header
-            self.pub_img.publish(img_msg)
+
+            # publish su topic solo se richiesto
+            if self.pub_img.get_subscription_count() > 0:
+                img_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
+                img_msg.header = det_msg.header
+                self.pub_img.publish(img_msg)
+
+        # ---- NEW: showimage locale (sempre quando enabled + show_window)
+        if self.show_window and self._window_open:
+            try:
+                to_show = annotated if annotated is not None else frame
+                cv2.imshow(self.window_name, to_show)
+                # indispensabile per far “respirare” la finestra
+                cv2.waitKey(1)
+            except Exception as e:
+                self.get_logger().warning(f"imshow/waitKey fallita (chiudo finestra): {e}")
+                self._close_window()
 
         # FPS EMA
         now = time.perf_counter()
@@ -287,6 +340,11 @@ class VisionNode(Node):
     def destroy_node(self):
         self.enabled = False
         self._release_camera()
+        self._close_window()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         super().destroy_node()
 
 
@@ -304,3 +362,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

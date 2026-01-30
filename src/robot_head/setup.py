@@ -59,6 +59,7 @@ setup(
             'speak_node = robot_head.speak_node:main',
             'head_orchestrator = robot_head.head_orchestrator:main',
             'eyes_node = robot_head.eyes_node:main',
+            'environment_node = robot_head.temp_node:main',
         ],
     },
 )
